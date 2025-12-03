@@ -61,7 +61,7 @@ func startBot(ctx context.Context) {
 		log.Fatal("Bot init failed:", err)
 	}
 
-	b.RegisterHandler(bot.HandlerTypeMessageText, bot.MatchTypeExact, func(ctx context.Context, b *bot.Bot, update *models.Update) {
+	b.RegisterHandler(bot.HandlerTypeMessageText, "", bot.MatchTypePrefix, func(ctx context.Context, b *bot.Bot, update *models.Update) {
 		if update.Message == nil || update.Message.Chat.ID != chatID {
 			return
 		}
@@ -79,9 +79,7 @@ func startBot(ctx context.Context) {
 		}
 	})
 
-	if err := b.Start(ctx); err != nil {
-		log.Println("Bot stopped:", err)
-	}
+	b.Start(ctx)
 }
 
 func rootHandler(w http.ResponseWriter, r *http.Request) {
