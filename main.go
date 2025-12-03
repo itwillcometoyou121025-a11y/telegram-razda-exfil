@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -420,9 +419,13 @@ func sendFileToTelegram(filename string, data []byte, caption string) {
 
 	if len(data) <= maxPartSize {
 		// Single part
+		inputFile := &models.InputFileUpload{
+			Filename: filename,
+			Data:     bytes.NewReader(data),
+		}
 		_, err = b.SendDocument(context.Background(), &bot.SendDocumentParams{
 			ChatID:   chatID,
-			Document: &models.InputFile{FileName: filename, Bytes: data},
+			Document: inputFile,
 			Caption:  caption,
 		})
 		if err != nil {
@@ -445,9 +448,13 @@ func sendFileToTelegram(filename string, data []byte, caption string) {
 		partData := data[start:end]
 		partName := fmt.Sprintf("%s.part%dof%d", filename, i+1, numParts)
 
+		partInputFile := &models.InputFileUpload{
+			Filename: partName,
+			Data:     bytes.NewReader(partData),
+		}
 		_, err = b.SendDocument(context.Background(), &bot.SendDocumentParams{
 			ChatID:   chatID,
-			Document: &models.InputFile{FileName: partName, Bytes: partData},
+			Document: partInputFile,
 			Caption:  fmt.Sprintf("%s\nPart %d/%d (%dB)", caption, i+1, numParts, len(partData)),
 		})
 		if err != nil {
