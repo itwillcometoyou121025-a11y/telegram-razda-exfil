@@ -1,4 +1,4 @@
-module radza-c2
+module telegram-razda-exfil
 
 go 1.21
 
