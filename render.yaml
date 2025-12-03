@@ -1,8 +1,0 @@
-services:
-  - type: web
-    name: telegram-razda-exfil
-    env: go
-    rootDir: .
-    buildCommand: "go mod download && go build -o main main.go"
-    startCommand: "./main"
-    runtime: go1.26
