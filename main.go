@@ -117,7 +117,6 @@ func startBot(ctx context.Context, webhookURL string, secret string) {
 	log.Printf("Webhook set to: %s", webhookURL)
 
 	// Start webhook listener in goroutine
-	go b.StartWebhook(ctx)
 }
 
 func messageHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
